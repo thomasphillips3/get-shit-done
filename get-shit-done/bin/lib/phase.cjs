@@ -364,6 +364,82 @@ function cmdPhasePlanIndex(cwd, phase, raw) {
   output(result, raw);
 }
 
+/**
+ * Locate the in-progress milestone section header in ROADMAP.md and return
+ * { headerIdx, headerEnd, sectionEnd } for insertion at the end of that
+ * section. Falls back to null if not found.
+ *
+ * Heuristic order:
+ *   1. A heading line containing 🚧 (e.g. "### 🚧 v0.6 (In Progress)")
+ *   2. A heading line containing "In Progress" (case-insensitive)
+ *   3. null — caller falls back to legacy heading-style insertion
+ *
+ * The section ends at the next heading at the same level (or higher).
+ */
+function locateInProgressMilestone(content) {
+  const patterns = [
+    /^(#{2,4})\s+[^\n]*🚧[^\n]*$/m,
+    /^(#{2,4})\s+[^\n]*\bIn Progress\b[^\n]*$/mi,
+  ];
+  let match = null;
+  let headingLevel = 0;
+  for (const p of patterns) {
+    const m = content.match(p);
+    if (m) { match = m; headingLevel = m[1].length; break; }
+  }
+  if (!match) return null;
+
+  const headerIdx = match.index;
+  const headerEnd = headerIdx + match[0].length;
+
+  const rest = content.slice(headerEnd);
+  const endPattern = new RegExp(`^#{1,${headingLevel}}\\s+`, 'm');
+  const endMatch = rest.match(endPattern);
+  const sectionEnd = endMatch ? headerEnd + endMatch.index : content.length;
+
+  return { headerIdx, headerEnd, sectionEnd };
+}
+
+/**
+ * Update the "## Milestones" summary line for the in-progress milestone.
+ * Looks for a line like "🚧 **v0.6** — Phases 23 scheduled" and extends the
+ * phase-range to include the new phase. Best-effort: leaves content
+ * unchanged if format doesn't match.
+ */
+function updateMilestonesSummary(content, newPhaseNum) {
+  const lineRe = /^(-\s*🚧\s+\*\*[^*]+\*\*\s*—\s*)(Phases?\s+)(\d+)(?:[–-](\d+))?(\s+scheduled[^\n]*)$/m;
+  const m = content.match(lineRe);
+  if (!m) return content;
+
+  const lo = parseInt(m[3], 10);
+  const hi = m[4] ? parseInt(m[4], 10) : lo;
+  if (newPhaseNum <= hi) return content;
+  const label = lo === newPhaseNum ? `Phase ${lo}` : `Phases ${lo}–${newPhaseNum}`;
+  return content.replace(lineRe, `${m[1]}${label}${m[5]}`);
+}
+
+/**
+ * Detect whether ROADMAP.md uses checkbox-bullet style phase entries
+ * (e.g. "- [ ] **Phase 23** — desc") for the given phase number. Returns
+ * the matched line (with its newline) or null. Tolerates the optional
+ * project-code prefix in the bullet text (rare, but symmetric with the
+ * directory scanner).
+ */
+function findBulletPhaseEntry(content, phaseId) {
+  const escaped = String(phaseId).replace(/\./g, '\\.');
+  const re = new RegExp(`^-\\s+\\[[ x~]\\]\\s+\\*\\*Phase\\s+${escaped}\\*\\*[^\\n]*\\n`, 'm');
+  const m = content.match(re);
+  return m ? { line: m[0], index: m.index, length: m[0].length } : null;
+}
+
+/**
+ * Generate a minimal phase README scaffold. Hand-authored READMEs are
+ * preserved (caller checks fs.existsSync first).
+ */
+function buildPhaseReadme(phaseId, description) {
+  return `# Phase ${phaseId} — ${description}\n\n**ROADMAP:** [.planning/ROADMAP.md](../../ROADMAP.md)\n\n## Goal\n\n[TBD]\n\n## Status\n\nNot planned yet. Run \`/gsd:plan-phase ${phaseId}\` to break this phase into plans.\n`;
+}
+
 function cmdPhaseAdd(cwd, description, raw, customId) {
   if (!description) {
     error('description required for phase add');
@@ -434,17 +510,44 @@ function cmdPhaseAdd(cwd, description, raw, customId) {
     fs.mkdirSync(dirPath, { recursive: true });
     fs.writeFileSync(path.join(dirPath, '.gitkeep'), '');
 
-    // Build phase entry
-    const dependsOn = config.phase_naming === 'custom' ? '' : `\n**Depends on:** Phase ${typeof _newPhaseId === 'number' ? _newPhaseId - 1 : 'TBD'}`;
-    const phaseEntry = `\n### Phase ${_newPhaseId}: ${description}\n\n**Goal:** [To be planned]\n**Requirements**: TBD${dependsOn}\n**Plans:** 0 plans\n\nPlans:\n- [ ] TBD (run /gsd-plan-phase ${_newPhaseId} to break down)\n`;
+    // Generate a minimal README so the phase directory is self-documenting
+    // even before /gsd:plan-phase runs. Hand-authored READMEs are preserved.
+    const readmePath = path.join(dirPath, 'README.md');
+    if (!fs.existsSync(readmePath)) {
+      fs.writeFileSync(readmePath, buildPhaseReadme(_newPhaseId, description), 'utf-8');
+    }
 
-    // Find insertion point: before last "---" or at end
+    // ── ROADMAP.md insertion ──────────────────────────────────────────────
+    // Prefer the in-progress milestone (🚧) section as a checkbox bullet,
+    // matching the bullet-style roadmap convention. Fall back to the legacy
+    // heading-style entry before the last "---" only if no 🚧 section
+    // exists (e.g. roadmaps that haven't adopted the bullet convention).
     let updatedContent;
-    const lastSeparator = rawContent.lastIndexOf('\n---');
-    if (lastSeparator > 0) {
-      updatedContent = rawContent.slice(0, lastSeparator) + phaseEntry + rawContent.slice(lastSeparator);
+    const loc = locateInProgressMilestone(rawContent);
+    const numericPhase = typeof _newPhaseId === 'number';
+
+    if (loc && numericPhase) {
+      const bullet = `- [ ] **Phase ${_newPhaseId}** — ${description} ([README](phases/${_dirName}/README.md)).`;
+      const sectionBody = rawContent.slice(loc.headerEnd, loc.sectionEnd);
+      const trimmed = sectionBody.replace(/\s+$/, '');
+      const newSectionBody = `${trimmed}\n${bullet}\n\n`;
+      updatedContent =
+        rawContent.slice(0, loc.headerEnd) +
+        newSectionBody +
+        rawContent.slice(loc.sectionEnd);
+
+      // Best-effort: extend the "## Milestones" summary range.
+      updatedContent = updateMilestonesSummary(updatedContent, _newPhaseId);
     } else {
-      updatedContent = rawContent + phaseEntry;
+      // Legacy/fallback path: heading-style entry before final --- or at EOF.
+      const dependsOn = config.phase_naming === 'custom' ? '' : `\n**Depends on:** Phase ${numericPhase ? _newPhaseId - 1 : 'TBD'}`;
+      const phaseEntry = `\n### Phase ${_newPhaseId}: ${description}\n\n**Goal:** [To be planned]\n**Requirements**: TBD${dependsOn}\n**Plans:** 0 plans\n\nPlans:\n- [ ] TBD (run /gsd-plan-phase ${_newPhaseId} to break down)\n`;
+      const lastSeparator = rawContent.lastIndexOf('\n---');
+      if (lastSeparator > 0) {
+        updatedContent = rawContent.slice(0, lastSeparator) + phaseEntry + rawContent.slice(lastSeparator);
+      } else {
+        updatedContent = rawContent + phaseEntry;
+      }
     }
 
     atomicWriteFileSync(roadmapPath, updatedContent);
@@ -554,8 +657,12 @@ function cmdPhaseInsert(cwd, afterPhase, description, raw) {
     const normalizedAfter = normalizePhaseName(afterPhase);
     const unpadded = normalizedAfter.replace(/^0+/, '');
     const afterPhaseEscaped = unpadded.replace(/\./g, '\\.');
-    const targetPattern = new RegExp(`#{2,4}\\s*Phase\\s+0*${afterPhaseEscaped}:`, 'i');
-    if (!targetPattern.test(content)) {
+    // Accept either heading-style (### Phase N:) OR checkbox-bullet style
+    // (- [ ] **Phase N** —). Bullet-style is the convention used by
+    // milestone-sectioned roadmaps; heading-style is the older format.
+    const headingProbe = new RegExp(`#{2,4}\\s*Phase\\s+0*${afterPhaseEscaped}:`, 'i');
+    const bulletProbe = new RegExp(`^-\\s+\\[[ x~]\\]\\s+\\*\\*Phase\\s+0*${afterPhaseEscaped}\\*\\*`, 'mi');
+    if (!headingProbe.test(content) && !bulletProbe.test(content) && !bulletProbe.test(rawContent)) {
       error(`Phase ${afterPhase} not found in ROADMAP.md`);
     }
 
@@ -596,28 +703,49 @@ function cmdPhaseInsert(cwd, afterPhase, description, raw) {
     fs.mkdirSync(dirPath, { recursive: true });
     fs.writeFileSync(path.join(dirPath, '.gitkeep'), '');
 
-    // Build phase entry
-    const phaseEntry = `\n### Phase ${_decimalPhase}: ${description} (INSERTED)\n\n**Goal:** [Urgent work - to be planned]\n**Requirements**: TBD\n**Depends on:** Phase ${afterPhase}\n**Plans:** 0 plans\n\nPlans:\n- [ ] TBD (run /gsd-plan-phase ${_decimalPhase} to break down)\n`;
-
-    // Insert after the target phase section
-    const headerPattern = new RegExp(`(#{2,4}\\s*Phase\\s+0*${afterPhaseEscaped}:[^\\n]*\\n)`, 'i');
-    const headerMatch = rawContent.match(headerPattern);
-    if (!headerMatch) {
-      error(`Could not find Phase ${afterPhase} header`);
+    // Generate minimal README scaffold for the inserted decimal phase.
+    const readmePath = path.join(dirPath, 'README.md');
+    if (!fs.existsSync(readmePath)) {
+      fs.writeFileSync(readmePath, buildPhaseReadme(_decimalPhase, description), 'utf-8');
     }
 
-    const headerIdx = rawContent.indexOf(headerMatch[0]);
-    const afterHeader = rawContent.slice(headerIdx + headerMatch[0].length);
-    const nextPhaseMatch = afterHeader.match(/\n#{2,4}\s+Phase\s+\d/i);
+    // ── ROADMAP.md insertion ──────────────────────────────────────────────
+    // If the parent phase is a checkbox bullet, insert a sibling bullet
+    // immediately after it (preserves bullet-style roadmaps). Otherwise
+    // fall back to heading-style insertion after the parent heading.
+    const bulletPattern = new RegExp(
+      `^-\\s+\\[[ x~]\\]\\s+\\*\\*Phase\\s+0*${afterPhaseEscaped}\\*\\*[^\\n]*\\n`, 'mi'
+    );
+    const bulletMatch = rawContent.match(bulletPattern);
 
-    let insertIdx;
-    if (nextPhaseMatch) {
-      insertIdx = headerIdx + headerMatch[0].length + nextPhaseMatch.index;
+    let updatedContent;
+    if (bulletMatch) {
+      // Sibling-bullet insertion. Mirror the existing bullet's indentation
+      // (almost always none for top-level lists, but be safe).
+      const indentMatch = bulletMatch[0].match(/^(\s*)/);
+      const indent = indentMatch ? indentMatch[1] : '';
+      const newBullet = `${indent}- [ ] **Phase ${_decimalPhase}** — ${description} ([README](phases/${_dirName}/README.md)).\n`;
+      const insertIdx = bulletMatch.index + bulletMatch[0].length;
+      updatedContent = rawContent.slice(0, insertIdx) + newBullet + rawContent.slice(insertIdx);
     } else {
-      insertIdx = rawContent.length;
+      // Heading-style fallback (preserves prior behavior for ### Phase N: roadmaps).
+      const phaseEntry = `\n### Phase ${_decimalPhase}: ${description} (INSERTED)\n\n**Goal:** [Urgent work - to be planned]\n**Requirements**: TBD\n**Depends on:** Phase ${afterPhase}\n**Plans:** 0 plans\n\nPlans:\n- [ ] TBD (run /gsd-plan-phase ${_decimalPhase} to break down)\n`;
+
+      const headerPattern = new RegExp(`(#{2,4}\\s*Phase\\s+0*${afterPhaseEscaped}:[^\\n]*\\n)`, 'i');
+      const headerMatch = rawContent.match(headerPattern);
+      if (!headerMatch) {
+        error(`Could not find Phase ${afterPhase} entry (no heading or bullet)`);
+      }
+      const headerIdx = rawContent.indexOf(headerMatch[0]);
+      const afterHeader = rawContent.slice(headerIdx + headerMatch[0].length);
+      const nextPhaseMatch = afterHeader.match(/\n#{2,4}\s+Phase\s+\d/i);
+
+      const insertIdx = nextPhaseMatch
+        ? headerIdx + headerMatch[0].length + nextPhaseMatch.index
+        : rawContent.length;
+      updatedContent = rawContent.slice(0, insertIdx) + phaseEntry + rawContent.slice(insertIdx);
     }
 
-    const updatedContent = rawContent.slice(0, insertIdx) + phaseEntry + rawContent.slice(insertIdx);
     atomicWriteFileSync(roadmapPath, updatedContent);
     return { decimalPhase: _decimalPhase, dirName: _dirName };
   });
