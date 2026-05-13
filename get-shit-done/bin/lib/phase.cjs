@@ -514,7 +514,7 @@ function cmdPhaseAdd(cwd, description, raw, customId) {
     // even before /gsd:plan-phase runs. Hand-authored READMEs are preserved.
     const readmePath = path.join(dirPath, 'README.md');
     if (!fs.existsSync(readmePath)) {
-      fs.writeFileSync(readmePath, buildPhaseReadme(_newPhaseId, description), 'utf-8');
+      atomicWriteFileSync(readmePath, buildPhaseReadme(_newPhaseId, description));
     }
 
     // ── ROADMAP.md insertion ──────────────────────────────────────────────
@@ -706,7 +706,7 @@ function cmdPhaseInsert(cwd, afterPhase, description, raw) {
     // Generate minimal README scaffold for the inserted decimal phase.
     const readmePath = path.join(dirPath, 'README.md');
     if (!fs.existsSync(readmePath)) {
-      fs.writeFileSync(readmePath, buildPhaseReadme(_decimalPhase, description), 'utf-8');
+      atomicWriteFileSync(readmePath, buildPhaseReadme(_decimalPhase, description));
     }
 
     // ── ROADMAP.md insertion ──────────────────────────────────────────────
