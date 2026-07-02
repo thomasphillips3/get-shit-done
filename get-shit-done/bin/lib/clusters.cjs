@@ -98,6 +98,7 @@ const CLUSTERS = Object.freeze({
     'fast',
     'quick',
     'autonomous',
+    'ralph',
     'config',
     'progress',
     'phase',
